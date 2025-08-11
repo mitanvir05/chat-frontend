@@ -13,21 +13,22 @@ import {
 
 // Connect to backend
 const socket = io(import.meta.env.VITE_SOCKET_URL, {
-  path: "/socket.io",
-  transports: ["websocket", "polling"],
-  withCredentials: true
+  transports: ["websocket"],
 });
 
 // Basic STUN; add TURN in prod
 const RTC_CONFIG = {
   iceServers: [
+    // Your existing STUN server
     { urls: "stun:stun.l.google.com:19302" },
-    // replace with your real TURN creds (udp/tcp + tls)
-    { urls: "turn:YOUR_TURN_HOST:3478?transport=udp", username: "USER", credential: "PASS" },
-    { urls: "turn:YOUR_TURN_HOST:3478?transport=tcp", username: "USER", credential: "PASS" },
-    { urls: "turns:YOUR_TURN_HOST:5349?transport=tcp", username: "USER", credential: "PASS" }
+
+    // --- Add the TURN server from Metered below ---
+    {
+      urls: "turn:YOUR_METERED_TURN_URL:80", // e.g., "turn:global.turn.metered.ca:80"
+      username: "YOUR_METERED_USERNAME",
+      credential: "YOUR_METERED_PASSWORD",
+    },
   ],
-  iceTransportPolicy: "relay" // <- for testing; change to "all" after it works
 };
 
 const App = () => {
@@ -84,17 +85,10 @@ const pendingIceRef = useRef([]);
     });
 
     socket.on("call-answered", async ({ fromUserId, answer }) => {
-  if (!pcRef.current) return;
-  await pcRef.current.setRemoteDescription(answer);
-
-  // FLUSH queued ICE now
-  for (const c of pendingIceRef.current) {
-    try { await pcRef.current.addIceCandidate(c); } catch (e) { console.error(e); }
-  }
-  pendingIceRef.current = [];
-
-  setInCallWith(fromUserId);
-});
+      if (!pcRef.current) return;
+      await pcRef.current.setRemoteDescription(answer);
+      setInCallWith(fromUserId);
+    });
 
   socket.on("ice-candidate", async ({ candidate }) => {
   try {
