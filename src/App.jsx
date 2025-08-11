@@ -1,13 +1,29 @@
 import React, { useState, useEffect, useRef } from "react";
 import io from "socket.io-client";
-import { Send, MessageSquare } from "lucide-react";
+import {
+  Send,
+  MessageSquare,
+  Phone,
+  PhoneOff,
+  Mic,
+  MicOff,
+  Video,
+  VideoOff,
+} from "lucide-react";
 
-// --- Connect to your backend server ---
-// Make sure your backend server is running
-const socket = io("http://localhost:5000");
+// Connect to backend
+const socket = io(import.meta.env.VITE_SOCKET_URL, { transports: ["websocket"] });
+
+// Basic STUN; add TURN in prod
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    // { urls: "turn:YOUR_TURN_HOST:3478", username: "USER", credential: "PASS" },
+  ],
+};
 
 const App = () => {
-  // State Management
+  // Chat states
   const [myId, setMyId] = useState("");
   const [userIdInput, setUserIdInput] = useState("");
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -16,13 +32,26 @@ const App = () => {
   const [newMessage, setNewMessage] = useState("");
   const [recipientId, setRecipientId] = useState("");
 
-  // Refs
+  // Call states
+  const [inCallWith, setInCallWith] = useState(""); // userId you're on a call with
+  const [incomingFrom, setIncomingFrom] = useState(""); // userId calling you
+  const [showIncomingModal, setShowIncomingModal] = useState(false);
+  const [isMicOn, setIsMicOn] = useState(true);
+  const [isCamOn, setIsCamOn] = useState(true);
+
+  // Streams and PC
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const remoteStreamRef = useRef(null);
+  const pcRef = useRef(null);
+
   const messagesEndRef = useRef(null);
 
+  // ========= Socket listeners =========
   useEffect(() => {
     if (!isLoggedIn) return;
 
-    // Socket event listeners
     socket.on("update-user-list", (userList) => {
       setUsers(userList.filter((u) => u !== myId));
     });
@@ -35,16 +64,202 @@ const App = () => {
       setMessages((prev) => [...prev, message]);
     });
 
+    // --- WebRTC signaling ---
+    socket.on("incoming-call", async ({ fromUserId, offer }) => {
+      // Prepare peer connection for answering
+      setIncomingFrom(fromUserId);
+      setShowIncomingModal(true);
+      // Store offer temporarily on window to avoid extra state pickle
+      window.__incomingOffer = offer;
+    });
+
+    socket.on("call-answered", async ({ fromUserId, answer }) => {
+      if (!pcRef.current) return;
+      await pcRef.current.setRemoteDescription(answer);
+      setInCallWith(fromUserId);
+    });
+
+    socket.on("ice-candidate", async ({ candidate }) => {
+      try {
+        if (pcRef.current && candidate) {
+          await pcRef.current.addIceCandidate(candidate);
+        }
+      } catch (err) {
+        console.error("Error adding remote ICE candidate:", err);
+      }
+    });
+
+    socket.on("call-ended", () => {
+      endCallLocalCleanup();
+    });
+
     return () => {
       socket.off("update-user-list");
       socket.off("load-messages");
       socket.off("new-message");
+      socket.off("incoming-call");
+      socket.off("call-answered");
+      socket.off("ice-candidate");
+      socket.off("call-ended");
     };
   }, [isLoggedIn, myId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // ========= Helpers =========
+  const createPeerConnection = () => {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+
+    // Remote tracks
+    const remoteStream = new MediaStream();
+    remoteStreamRef.current = remoteStream;
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+
+    pc.ontrack = (e) => {
+      e.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
+    };
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate && inCallWith) {
+        socket.emit("ice-candidate", {
+          toUserId: inCallWith,
+          fromUserId: myId,
+          candidate: e.candidate,
+        });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s === "failed" || s === "disconnected" || s === "closed") {
+        endCallLocalCleanup();
+      }
+    };
+
+    pcRef.current = pc;
+    return pc;
+  };
+
+  const getMedia = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: true,
+    });
+    localStreamRef.current = stream;
+    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    return stream;
+  };
+
+  const attachLocalTracks = (pc, stream) => {
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+  };
+
+  // ========= Call flows =========
+
+  const startCall = async (toUserId) => {
+    if (!toUserId) return;
+
+    setInCallWith(toUserId);
+
+    const pc = createPeerConnection();
+    const stream = await getMedia();
+    attachLocalTracks(pc, stream);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    socket.emit("call-user", {
+      toUserId,
+      fromUserId: myId,
+      offer,
+    });
+  };
+
+  const acceptCall = async () => {
+    const fromUserId = incomingFrom;
+    setShowIncomingModal(false);
+    setInCallWith(fromUserId);
+
+    const pc = createPeerConnection();
+    const stream = await getMedia();
+    attachLocalTracks(pc, stream);
+
+    const offer = window.__incomingOffer;
+    await pc.setRemoteDescription(offer);
+
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    socket.emit("answer-call", {
+      toUserId: fromUserId,
+      fromUserId: myId,
+      answer,
+    });
+
+    delete window.__incomingOffer;
+  };
+
+  const declineCall = () => {
+    setShowIncomingModal(false);
+    setIncomingFrom("");
+    delete window.__incomingOffer;
+  };
+
+  const endCall = () => {
+    if (!inCallWith) return;
+    socket.emit("end-call", { toUserId: inCallWith, fromUserId: myId });
+    endCallLocalCleanup();
+  };
+
+  const endCallLocalCleanup = () => {
+    setIncomingFrom("");
+    setInCallWith("");
+
+    if (pcRef.current) {
+      try {
+        pcRef.current.ontrack = null;
+        pcRef.current.onicecandidate = null;
+        pcRef.current.close();
+      } catch {}
+      pcRef.current = null;
+    }
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = null;
+    }
+    if (remoteStreamRef.current) {
+      remoteStreamRef.current.getTracks().forEach((t) => t.stop());
+      remoteStreamRef.current = null;
+    }
+
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+  };
+
+  const toggleMic = () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const track = stream.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setIsMicOn(track.enabled);
+  };
+
+  const toggleCam = () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    setIsCamOn(track.enabled);
+  };
+
+  // ========= Auth / Chat actions =========
 
   const handleLogin = (e) => {
     e.preventDefault();
@@ -60,7 +275,7 @@ const App = () => {
     if (newMessage.trim() && recipientId) {
       socket.emit("send-message", {
         senderId: myId,
-        recipientId: recipientId,
+        recipientId,
         text: newMessage,
       });
       setNewMessage("");
@@ -110,31 +325,102 @@ const App = () => {
             {users.map((user) => (
               <li
                 key={user}
-                onClick={() => setRecipientId(user)}
-                className={`p-2 rounded-lg mb-2 flex justify-between items-center transition-all cursor-pointer ${
+                className={`p-2 rounded-lg mb-2 flex justify-between items-center transition-all ${
                   recipientId === user
                     ? "bg-teal-600"
                     : "bg-gray-700 hover:bg-gray-600"
                 }`}
               >
-                <span>{user}</span>
-                <MessageSquare size={16} />
+                <button
+                  onClick={() => setRecipientId(user)}
+                  className="flex items-center gap-2"
+                >
+                  <span>{user}</span>
+                  <MessageSquare size={16} />
+                </button>
+                <button
+                  onClick={() => startCall(user)}
+                  className="ml-2 bg-teal-500 hover:bg-teal-600 px-2 py-1 rounded flex items-center gap-1"
+                  title="Start video call"
+                >
+                  <Phone size={16} /> Call
+                </button>
               </li>
             ))}
           </ul>
         </div>
       </div>
 
-      {/* Main Content */}
+      {/* Main */}
       <div className="w-3/4 flex flex-col">
+        {/* Header */}
+        <div className="bg-gray-800 p-3 flex items-center justify-between border-b border-gray-700">
+          <div>
+            <h3 className="text-lg font-semibold">
+              Chat with:{" "}
+              <span className="text-teal-400">
+                {recipientId || "Select a user"}
+              </span>
+            </h3>
+            {inCallWith && (
+              <p className="text-xs text-gray-400">In call with {inCallWith}</p>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => recipientId && startCall(recipientId)}
+              className="bg-teal-600 hover:bg-teal-700 px-3 py-2 rounded flex items-center gap-2 disabled:opacity-50"
+              disabled={!recipientId || !!inCallWith}
+              title="Start video call"
+            >
+              <Phone size={16} /> Call
+            </button>
+            <button
+              onClick={endCall}
+              className="bg-red-600 hover:bg-red-700 px-3 py-2 rounded flex items-center gap-2 disabled:opacity-50"
+              disabled={!inCallWith}
+              title="End call"
+            >
+              <PhoneOff size={16} /> Hang up
+            </button>
+            <button
+              onClick={toggleMic}
+              className="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded flex items-center gap-2 disabled:opacity-50"
+              disabled={!inCallWith}
+              title="Toggle mic"
+            >
+              {isMicOn ? <Mic size={16} /> : <MicOff size={16} />} Mic
+            </button>
+            <button
+              onClick={toggleCam}
+              className="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded flex items-center gap-2 disabled:opacity-50"
+              disabled={!inCallWith}
+              title="Toggle camera"
+            >
+              {isCamOn ? <Video size={16} /> : <VideoOff size={16} />} Cam
+            </button>
+          </div>
+        </div>
+
+        {/* Video Area */}
+        <div className="bg-black flex gap-2 p-3 h-72 border-b border-gray-800">
+          <video
+            ref={localVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className="bg-gray-900 rounded-lg w-1/3 object-cover"
+          />
+          <video
+            ref={remoteVideoRef}
+            autoPlay
+            playsInline
+            className="bg-gray-900 rounded-lg flex-1 object-cover"
+          />
+        </div>
+
         {/* Chat Area */}
         <div className="h-full bg-gray-800 flex flex-col p-4">
-          <h3 className="text-lg font-semibold mb-2">
-            Chat with:{" "}
-            <span className="text-teal-400">
-              {recipientId || "Select a user"}
-            </span>
-          </h3>
           <div className="flex-grow overflow-y-auto mb-2 pr-2">
             {messages
               .filter(
@@ -179,6 +465,33 @@ const App = () => {
           </form>
         </div>
       </div>
+
+      {/* Incoming Call Modal */}
+      {showIncomingModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 w-full max-w-sm">
+            <h4 className="text-xl font-semibold mb-2">Incoming call</h4>
+            <p className="text-gray-300 mb-4">
+              from{" "}
+              <span className="text-teal-400 font-mono">{incomingFrom}</span>
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={acceptCall}
+                className="flex-1 bg-teal-600 hover:bg-teal-700 py-2 rounded flex items-center justify-center gap-2"
+              >
+                <Phone size={16} /> Accept
+              </button>
+              <button
+                onClick={declineCall}
+                className="flex-1 bg-red-600 hover:bg-red-700 py-2 rounded flex items-center justify-center gap-2"
+              >
+                <PhoneOff size={16} /> Decline
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
