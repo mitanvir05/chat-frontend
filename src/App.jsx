@@ -21,7 +21,11 @@ const RTC_CONFIG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     {
-      urls: "turn:global.turn.twilio.com:3478?transport=udp",
+      // Providing both UDP and TCP transports for the TURN server
+      urls: [
+        "turn:global.turn.twilio.com:3478?transport=udp",
+        "turn:global.turn.twilio.com:3478?transport=tcp",
+      ],
       username: "AC1fef2b35d5f6de781c4a98af1d3e6c48", // Your Account SID
       credential: "955d0e5c724e7163b1c0f0d06fe70680", // Your Auth Token
     },
