@@ -19,14 +19,11 @@ const socket = io(import.meta.env.VITE_SOCKET_URL, {
 // Basic STUN; add TURN in prod
 const RTC_CONFIG = {
   iceServers: [
-    // Your existing STUN server
     { urls: "stun:stun.l.google.com:19302" },
-
-    // --- Add the TURN server from Metered below ---
     {
-      urls: "turn:YOUR_METERED_TURN_URL:80", // e.g., "turn:global.turn.metered.ca:80"
-      username: "YOUR_METERED_USERNAME",
-      credential: "YOUR_METERED_PASSWORD",
+      urls: "turn:global.turn.twilio.com:3478?transport=udp",
+      username: "AC1fef2b35d5f6de781c4a98af1d3e6c48", // Your Account SID
+      credential: "955d0e5c724e7163b1c0f0d06fe70680", // Your Auth Token
     },
   ],
 };
@@ -126,7 +123,7 @@ const pendingIceRef = useRef([]);
 
   // ========= Helpers =========
   const createPeerConnection = () => {
-  console.log("Creating new RTCPeerConnection...");
+  console.log("Creating new RTCPeerConnection.......");
   const pc = new RTCPeerConnection(RTC_CONFIG);
 
   // Remote track handling
